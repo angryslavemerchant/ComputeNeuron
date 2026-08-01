@@ -14,10 +14,14 @@ The ONLY difference is connectivity:
 Same layer sizes, same nonlinearity, same everything else — so any difference
 in wall clock is attributable to the sparsity and nothing else.
 
+Batch size matters more than anything else here. At small batches every model
+is bound by kernel launch latency and the results say nothing; the dendritic
+layer's arithmetic advantage only shows up once the GPU is saturated.
+
 Usage:
     python bench.py                    # cuda if available
     python bench.py --no-compile       # skip the compiled rows
-    python bench.py --wiring tiled     # the other wiring pattern
+    python bench.py --fan-in 32        # inputs per dendrite
 """
 
 import argparse
@@ -28,7 +32,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dendritic_linear import DendriticLinear
-from ring_dendritic import RingDendriticLinear
 
 # Dendritic layers are launch-bound in eager mode and recompile on grad-mode
 # flips; without this the later configs silently fall back to eager.
@@ -104,19 +107,10 @@ def measure(model, x, device, label, macs, base=None):
     return fwd, fb
 
 
-def build_dendritic(wiring, n, s, k, d, dilation):
-    if wiring == "ring":
-        return RingDendriticLinear(n, s, fan_in=k, dendrites_per_soma=d,
-                                   dilation=dilation)
-    # tiled: same architecture, sequential-block wiring
-    return DendriticLinear(n, s, fan_in=k, coverage=d * k / n)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fan-in", type=int, default=16, help="inputs per dendrite (K)")
-    ap.add_argument("--wiring", default="both", choices=["ring", "tiled", "both"])
     ap.add_argument("--no-compile", action="store_true")
     args = ap.parse_args()
 
@@ -146,23 +140,19 @@ def main():
         if base is None:
             continue
 
-        wirings = ["ring", "tiled"] if args.wiring == "both" else [args.wiring]
-        for wiring in wirings:
-            dils = [1, "uniform"] if wiring == "ring" else [None]
-            for dil in dils:
-                m = build_dendritic(wiring, N, S, args.fan_in, D, dil).to(device)
-                macs = M * args.fan_in + M
-                tag = f"{wiring}" + (f" dil={dil}" if dil is not None else "")
-                measure(m, x, device, tag, macs, base)
+        m = DendriticLinear(N, S, fan_in=args.fan_in,
+                            dendrites_per_soma=D).to(device)
+        macs = m.sparsity()["macs"]
+        measure(m, x, device, "dendritic", macs, base)
 
-                if not args.no_compile:
-                    torch._dynamo.reset()
-                    measure(torch.compile(m), x, device, f"  ^ compiled", macs, base)
-                    torch._dynamo.reset()
+        if not args.no_compile:
+            torch._dynamo.reset()
+            measure(torch.compile(m), x, device, "  ^ compiled", macs, base)
+            torch._dynamo.reset()
 
-                del m
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+        del m
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print()
 
 

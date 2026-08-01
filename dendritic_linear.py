@@ -4,36 +4,49 @@ import torch.nn.functional as F
 
 
 class DendriticLinear(nn.Module):
-    """Drop-in replacement for nn.Linear (or a full FFN) with dendritic structure.
+    """A sparse two-stage layer:
 
-    Each output (soma) owns D dendrites. Each dendrite gathers K features
-    from the input via a fixed random index pattern, computes a weighted sum,
-    and passes through a nonlinearity. The soma then takes a cable-weighted
-    sum of its dendrites to produce one scalar output.
+        N inputs  ->  M = S*D dendrites  ->  leaky_relu  ->  S soma
 
-    Because the dendrite stage already provides expand -> nonlinearity -> contract,
-    a single DendriticLinear(d, d) can replace an entire 2-layer FFN.
+    Each dendrite reads K inputs and applies a nonlinearity; each soma takes a
+    weighted sum of its OWN D dendrites. Dendrites are private to their soma.
 
-    Parameter count ≈ out_features * coverage * in_features  (for K >> 1).
-    At coverage=1.0 this matches nn.Linear(in, out) in param count.
+    The shape-matched dense equivalent is Linear(N, M) -> leaky_relu ->
+    Linear(M, S): same units in every layer, same nonlinearity, but every unit
+    connected to everything. This layer does M*K + M multiply-adds per input
+    vector against the dense N*M + M*S, which at N=1024, K=16, D=4 is ~75x
+    less arithmetic and ~70x fewer parameters.
+
+    Sizing: specify `dendrites_per_soma` (D). The total dendrite count is
+    M = out_features * D, and that M is what a dense baseline's hidden layer
+    should be set to for a fair comparison.
+
+    Note that D and K together decide how much of the input each soma sees:
+    a soma reads D*K inputs out of N. With D=4, K=16, N=1024 that is 64 of
+    1024 — genuinely sparse. Setting D = N/K makes every soma read the entire
+    input, which costs the same as a dense layer while being far slower to
+    execute; that is what `coverage=1.0` does, and it is almost never what
+    you want.
 
     Args:
-        in_features:   Input dimension  (N)
-        out_features:  Output dimension (S — number of soma)
-        fan_in:        How many input features each dendrite reads.
-                       int  -> absolute count (e.g. 64 means each dendrite reads 64 features)
-                       float -> fraction of in_features (e.g. 0.1 means 10%)
-        coverage:      How many times each soma's dendrites tile the input.
-                       D = max(1, round(coverage * N / K))
-        bias:          Include bias terms on dendrites and soma.
+        in_features:        Input dimension (N).
+        out_features:       Number of soma (S) — the output dimension.
+        fan_in:             Inputs per dendrite (K). int -> absolute count,
+                            float -> fraction of in_features.
+        dendrites_per_soma: D. Preferred way to size the layer.
+        coverage:           Legacy alternative to D: D = round(coverage*N/K),
+                            i.e. how many times each soma tiles the input.
+                            Ignored when dendrites_per_soma is given.
+        bias:               Bias terms on dendrites and soma.
     """
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        fan_in: int | float = 0.1,
-        coverage: float = 1.0,
+        fan_in: int | float = 16,
+        dendrites_per_soma: int | None = None,
+        coverage: float | None = None,
         bias: bool = True,
     ):
         super().__init__()
@@ -45,7 +58,14 @@ class DendriticLinear(nn.Module):
             self.K = max(1, min(in_features, fan_in))
         else:
             self.K = max(1, min(in_features, round(fan_in * in_features)))
-        self.D = max(1, round(coverage * in_features / self.K))
+
+        if dendrites_per_soma is not None:
+            self.D = max(1, dendrites_per_soma)
+        elif coverage is not None:
+            self.D = max(1, round(coverage * in_features / self.K))
+        else:
+            self.D = 4
+        self.M = out_features * self.D
 
         S, D, K = self.out_features, self.D, self.K
 
@@ -136,10 +156,23 @@ class DendriticLinear(nn.Module):
         return s
 
     # ------------------------------------------------------------------
+    def sparsity(self) -> dict:
+        """Multiply-adds per input vector vs the shape-matched dense MLP
+        (Linear(N, M) -> leaky_relu -> Linear(M, S))."""
+        ours = self.M * self.K + self.M
+        dense = self.in_features * self.M + self.M * self.out_features
+        return {
+            "dendrites": self.M,
+            "inputs_seen_per_soma": min(self.D * self.K, self.in_features),
+            "macs": ours,
+            "dense_macs": dense,
+            "fraction_of_dense": ours / dense,
+        }
+
     def extra_repr(self) -> str:
         p = sum(p.numel() for p in self.parameters())
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"K={self.K}, D={self.D}, "
+            f"K={self.K}, D={self.D}, M={self.M}, "
             f"total_params={p}"
         )
