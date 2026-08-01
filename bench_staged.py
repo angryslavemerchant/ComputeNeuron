@@ -92,12 +92,21 @@ def main():
         x = torch.randn(B, N, device=device)
         print(f"=== batch={B} | {N} -> {M} ===")
         print(f"  {'module':<24} {'params':>10} {'MACs/vec':>11} "
-              f"{'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs plain")
+              f"{'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs plain (like for like)")
 
-        base = measure(PlainLinear(N, M).to(device), x, device,
-                       "Linear + leaky_relu", N * M)
+        # Two baselines: eager rows are compared against the eager baseline and
+        # compiled rows against the compiled one, so no row is ever measured
+        # against a differently-optimised reference.
+        plain = PlainLinear(N, M).to(device)
+        base = measure(plain, x, device, "Linear + leaky_relu", N * M)
         if base is None:
             continue
+        base_c = base
+        if not args.no_compile:
+            torch._dynamo.reset()
+            base_c = measure(torch.compile(plain), x, device,
+                             "  ^ compiled", N * M, base) or base
+            torch._dynamo.reset()
 
         for s in stage_list:
             m_ = StagedLinear(N, M, stages=s).to(device)
@@ -108,7 +117,7 @@ def main():
             if not args.no_compile:
                 torch._dynamo.reset()
                 measure(torch.compile(m_), x, device, "  ^ compiled",
-                        c["macs"], base)
+                        c["macs"], base_c)
                 torch._dynamo.reset()
 
             del m_

@@ -36,9 +36,11 @@ assert that every input's gradient is non-zero.
 
 ### Results
 
-**These numbers predate the input-coverage fix** — they were measured when every soma
-read the same first `D*K` inputs, so the layer was doing less work than intended. They
-need a rerun.
+**These numbers are stale on two counts** and need a rerun. They predate the
+input-coverage fix (every soma read the same first `D*K` inputs, so the layer did less
+work than intended), and they compare a *compiled* dendritic layer against an
+*uncompiled* dense baseline, which overstates the speedup. The benchmark now compiles
+both sides.
 
 On an RTX 5090, fp32, at 2048 → 2048 hidden → 512, batch 16384:
 

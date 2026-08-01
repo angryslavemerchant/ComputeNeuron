@@ -127,6 +127,23 @@ def measure(model, x, device, label, macs, base=None, pad=26):
     return fwd, fb
 
 
+def baseline(model, x, device, label, macs, compile_on):
+    """Time the dense baseline eagerly AND compiled.
+
+    Returns (eager, compiled) so eager rows can be compared against the eager
+    baseline and compiled rows against the compiled one. Comparing a compiled
+    model against an uncompiled baseline overstates the speedup — inductor
+    speeds up the baseline too.
+    """
+    eager = measure(model, x, device, label, macs)
+    if eager is None or not compile_on:
+        return eager, eager
+    torch._dynamo.reset()
+    comp = measure(torch.compile(model), x, device, "  ^ compiled", macs, eager)
+    torch._dynamo.reset()
+    return eager, (comp or eager)
+
+
 def crossover(rows):
     """Where does the dendritic/dense ratio cross 1.0?
 
@@ -181,8 +198,9 @@ def sweep_one(args, device, K):
     else:
         dense_model = DenseMLP(N, DH, S)
         dense_macs = DenseMLP.macs(N, DH, S)
-    base = measure(dense_model.to(device), x, device,
-                   f"dense {shape}", dense_macs, pad=40)
+    base, base_c = baseline(dense_model.to(device), x, device,
+                            f"{'dense ' + shape:<40}", dense_macs,
+                            not args.no_compile)
     if base is None:
         return
     print()
@@ -201,17 +219,21 @@ def sweep_one(args, device, K):
         else:
             m = DendriticLinear(N, S, fan_in=K, dendrites_per_soma=d).to(device)
             info = m.sparsity()
+        # sweep rows are compiled, so they are scored against the COMPILED
+        # dense baseline
+        ref = base
         if not args.no_compile:
             torch._dynamo.reset()
             m = torch.compile(m)
+            ref = base_c
 
         label = (f"{d:>4} {info['dendrites']:>7} {info['groups']:>4} "
                  f"{d * K / N:>7.3f} {info['inputs_seen_per_soma']:>6} "
                  f"{info['inputs_covered']:>7}")
-        got = measure(m, x, device, label, info["macs"], base, pad=0)
+        got = measure(m, x, device, label, info["macs"], ref, pad=0)
         if got is not None:
-            fwd_rows.append((d, d * K / N, got[0] / base[0]))
-            fb_rows.append((d, d * K / N, got[1] / base[1]))
+            fwd_rows.append((d, d * K / N, got[0] / ref[0]))
+            fb_rows.append((d, d * K / N, got[1] / ref[1]))
 
         if not args.no_compile:
             torch._dynamo.reset()
@@ -298,8 +320,9 @@ def main():
         print(f"  {'module':<26} {'params':>9} {'MACs/vec':>10} "
               f"{'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs dense")
 
-        base = measure(DenseMLP(N, M, S).to(device), x, device,
-                       f"dense {N}->{M}->{S}", DenseMLP.macs(N, M, S))
+        base, base_c = baseline(DenseMLP(N, M, S).to(device), x, device,
+                                f"dense {N}->{M}->{S}", DenseMLP.macs(N, M, S),
+                                not args.no_compile)
         if base is None:
             continue
 
@@ -314,7 +337,7 @@ def main():
             if not args.no_compile:
                 torch._dynamo.reset()
                 measure(torch.compile(m), x, device, "  ^ compiled",
-                        info["macs"], base)
+                        info["macs"], base_c)
                 torch._dynamo.reset()
 
             del m
@@ -326,9 +349,10 @@ def main():
         # like-for-like comparison.
         if args.readout:
             print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {OUT} --")
-            base3 = measure(DenseMLP3(N, M, S, OUT).to(device), x, device,
-                            f"dense {N}->{M}->{S}->{OUT}",
-                            DenseMLP3.macs(N, M, S, OUT))
+            base3, base3_c = baseline(
+                DenseMLP3(N, M, S, OUT).to(device), x, device,
+                f"dense {N}->{M}->{S}->{OUT}", DenseMLP3.macs(N, M, S, OUT),
+                not args.no_compile)
             if base3 is not None:
                 for K in args.fan_in:
                     mm = DendriticMLP(N, S, out_features=OUT, fan_in=K,
@@ -339,7 +363,7 @@ def main():
                     if not args.no_compile:
                         torch._dynamo.reset()
                         measure(torch.compile(mm), x, device, "  ^ compiled",
-                                info["macs"], base3)
+                                info["macs"], base3_c)
                         torch._dynamo.reset()
                     del mm
                     if device.type == "cuda":
