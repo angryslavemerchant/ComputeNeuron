@@ -242,10 +242,9 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--sweep", action="store_true",
                     help="grow D until the dendritic layer costs as much as dense")
-    ap.add_argument("--no-readout", dest="readout", action="store_false",
-                    help="sweep WITHOUT the dense readout layer (it is on by "
-                         "default, on both models)")
-    ap.set_defaults(readout=True)
+    ap.add_argument("--readout", action="store_true",
+                    help="add a dense readout layer on top of the soma (on both "
+                         "models). Off by default: the layer's output IS the soma.")
     ap.add_argument("--shape", default=None,
                     help="override the built-in configs: N,M,S or N,M,S,out "
                          "(e.g. --shape 2048,512,10,10). M is the hidden/dendrite "
@@ -322,27 +321,29 @@ def main():
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        # --- with a dense readout on the soma: N -> M -> S -> OUT ---
+        # --- optional dense readout on the soma: N -> M -> S -> OUT ---
         # Baseline is the same four layers fully connected, so this stays a
         # like-for-like comparison.
-        print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {OUT} --")
-        base3 = measure(DenseMLP3(N, M, S, OUT).to(device), x, device,
-                        f"dense {N}->{M}->{S}->{OUT}", DenseMLP3.macs(N, M, S, OUT))
-        if base3 is not None:
-            for K in args.fan_in:
-                mm = DendriticMLP(N, S, out_features=OUT, fan_in=K,
-                                  dendrites_per_soma=D).to(device)
-                info = mm.sparsity()
-                measure(mm, x, device, f"dendritic K={K} + readout",
-                        info["macs"], base3)
-                if not args.no_compile:
-                    torch._dynamo.reset()
-                    measure(torch.compile(mm), x, device, "  ^ compiled",
+        if args.readout:
+            print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {OUT} --")
+            base3 = measure(DenseMLP3(N, M, S, OUT).to(device), x, device,
+                            f"dense {N}->{M}->{S}->{OUT}",
+                            DenseMLP3.macs(N, M, S, OUT))
+            if base3 is not None:
+                for K in args.fan_in:
+                    mm = DendriticMLP(N, S, out_features=OUT, fan_in=K,
+                                      dendrites_per_soma=D).to(device)
+                    info = mm.sparsity()
+                    measure(mm, x, device, f"dendritic K={K} + readout",
                             info["macs"], base3)
-                    torch._dynamo.reset()
-                del mm
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                    if not args.no_compile:
+                        torch._dynamo.reset()
+                        measure(torch.compile(mm), x, device, "  ^ compiled",
+                                info["macs"], base3)
+                        torch._dynamo.reset()
+                    del mm
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
         print()
 
 
