@@ -75,9 +75,12 @@ class NeighborLinear(nn.Module):
 
         if neighbors:
             # centred window: neighbors=3 -> (-1, 0, 1); neighbors=2 -> (0, 1)
-            offsets = torch.arange(neighbors) - (neighbors // 2)
-            self.register_buffer("offsets", offsets)
-            self.centre = int((offsets == 0).nonzero()[0])
+            # Plain Python ints, NOT a buffer: reading an int out of a tensor
+            # inside forward graph-breaks dynamo on every iteration, which
+            # silently disables compilation for the whole module.
+            self.offsets = tuple(range(-(neighbors // 2),
+                                       neighbors - (neighbors // 2)))
+            self.centre = self.offsets.index(0)
 
             self.mix = nn.Parameter(torch.empty(neighbors, out_features))
             self.shift = nn.Parameter(torch.zeros(out_features))
@@ -102,8 +105,7 @@ class NeighborLinear(nn.Module):
         # shifted multiply-adds: roll(h, -off) puts neuron j+off at position j,
         # so no gather is needed and the whole loop fuses under compile
         acc = None
-        for t in range(self.neighbors):
-            off = int(self.offsets[t])
+        for t, off in enumerate(self.offsets):
             hs = h if off == 0 else h.roll(-off, dims=-1)
             term = self.mix[t] * hs
             acc = term if acc is None else acc + term

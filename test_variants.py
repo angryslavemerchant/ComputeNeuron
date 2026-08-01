@@ -55,6 +55,26 @@ def test_neighbors_actually_mix():
     print("  ok  neighbors=3 reads 3 rows, wrapping around the ring")
 
 
+def test_no_graph_breaks():
+    """The roll offsets must be Python ints. Reading them out of a tensor
+    inside forward graph-breaks dynamo and silently disables compilation --
+    the symptom is compiled timings identical to eager ones."""
+    m = NeighborLinear(32, 16, neighbors=5)
+    assert all(isinstance(o, int) for o in m.offsets), m.offsets
+
+    try:
+        import torch._dynamo as dynamo
+    except ImportError:
+        print("  ok  offsets are Python ints (dynamo unavailable to verify)")
+        return
+
+    explanation = dynamo.explain(m)(torch.randn(4, 32))
+    assert explanation.graph_break_count == 0, (
+        f"{explanation.graph_break_count} graph break(s): "
+        f"{explanation.break_reasons}")
+    print(f"  ok  compiles to {explanation.graph_count} graph, no breaks")
+
+
 def test_branches_are_parallel_not_sequential():
     """Each branch must read the same z: zeroing one branch weight must not
     change what the others compute."""
@@ -115,6 +135,7 @@ if __name__ == "__main__":
     test_zero_is_plain()
     test_neighbors_one_is_a_sequential_stage()
     test_neighbors_actually_mix()
+    test_no_graph_breaks()
     test_branches_are_parallel_not_sequential()
     test_branch_bends_are_reachable()
     test_shapes_and_cost()
