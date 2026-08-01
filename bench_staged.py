@@ -1,12 +1,15 @@
 """Speed/params/FLOPs for StagedLinear against a plain Linear + leaky_relu.
 
-Everything is width-matched, so the only difference is how many
+Everything is width-matched, so the only difference is how many per-neuron
 scale/shift/nonlinearity stages sit on top of the one matmul. The question is
 whether extra stages are effectively free.
 
+extra_stages=0 is a plain Linear + leaky_relu with no extra parameters, so it
+should land exactly on the baseline; anything above that is the real cost.
+
 Usage:
     python bench_staged.py
-    python bench_staged.py --stages 1,2,4,8 --batch 16384
+    python bench_staged.py --extra-stages 0,1,4,8 --batch 16384
     python bench_staged.py --no-compile
 """
 
@@ -65,13 +68,14 @@ def measure(model, x, device, label, macs, base=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--stages", default="1,2,3,4,8",
-                    help="comma-separated stage counts to test")
+    ap.add_argument("--extra-stages", default="0,1,2,3,7",
+                    help="comma-separated per-neuron stage counts; 0 is a plain "
+                         "Linear + leaky_relu")
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--shape", default=None, help="N,M (default: several)")
     args = ap.parse_args()
-    stage_list = [int(s) for s in args.stages.split(",") if s.strip()]
+    stage_list = [int(s) for s in args.extra_stages.split(",") if s.strip()]
 
     device = torch.device(args.device)
     torch.manual_seed(0)
@@ -109,9 +113,9 @@ def main():
             torch._dynamo.reset()
 
         for s in stage_list:
-            m_ = StagedLinear(N, M, stages=s).to(device)
+            m_ = StagedLinear(N, M, extra_stages=s).to(device)
             c = m_.cost()
-            tag = f"staged s={s} ({s} bend{'s' if s > 1 else ''})"
+            tag = f"extra={s} ({c['bends']} bends)" + (" = plain" if s == 0 else "")
             measure(m_, x, device, tag, c["macs"], base)
 
             if not args.no_compile:

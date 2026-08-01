@@ -71,35 +71,39 @@ A different bet: instead of sparsifying the connections, keep the dense matmul a
 give each neuron a learnable activation shape.
 
 ```
-z  = W x + b
-z <- leaky_relu(a_i * z + c_i)     for i in 1..stages
+z  = leaky_relu(W x + b)               the ordinary dense layer
+z <- leaky_relu(a_i * z + c_i)         for i in 1..extra_stages
 ```
 
 `a_i` and `c_i` are one scalar per neuron, so neuron *j* in each stage reads only
-neuron *j* below it. All mixing happens in the single matmul; the stages only bend
-each neuron's response curve, one extra bend per stage.
+neuron *j* below it. All mixing happens in the single matmul; the extra stages only
+bend each neuron's response curve, one more bend per stage.
 
 ```python
 from staged_linear import StagedLinear
 
-layer = StagedLinear(2048, 512, stages=2)
+layer = StagedLinear(2048, 512, extra_stages=1)
 ```
 
-`stages=1` is the **control**, not a setting: `phi(a*(Wx+b)+c)` is affine inside the
-nonlinearity, so it is exactly `nn.Linear` + `leaky_relu` with rescaled weights.
-`stages=2` is the smallest setting that adds anything.
+`extra_stages=0` **is** a plain `nn.Linear` + `leaky_relu`, with no extra parameters
+at all — an exact control. `extra_stages=1` is the smallest interesting setting: one
+per-neuron weight, bias and nonlinearity stacked on the layer.
+
+The extra weight and bias only buy something *because* a nonlinearity sits in front of
+them. Without one, `a*(Wx+b)+c` is still affine and folds back into `W` and `b`.
 
 Stages are nearly free — 2·`out_features` parameters and one elementwise pass each,
 against a matmul of `in_features`·`out_features`. At 2048 → 512 that's 1024 params on
-1.05M, ~0.1%.
+1.05M, ~0.1%. Run it compiled: the stages fuse into the matmul epilogue, and eager
+pays a real per-stage cost.
 
-By default each stage uses a negative slope of `negative_slope**(1/stages)`, so the
-composite slope is 0.1 regardless of depth. Without that, stacking leaky_relu decays
-the negative slope geometrically (0.1 → 0.01 → 0.001) and depths would start from
-different functions, confounding the comparison.
+By default each nonlinearity uses a negative slope of
+`negative_slope**(1/(extra_stages+1))`, so the composite slope is 0.1 regardless of
+depth. Without that, stacking decays it geometrically (0.1 → 0.01 → 0.001) and depths
+would start from different functions, confounding any comparison.
 
 ```bash
-python bench_staged.py --stages 1,2,4,8
+python bench_staged.py --extra-stages 0,1,2,3,7
 python test_staged_linear.py
 ```
 
