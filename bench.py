@@ -186,9 +186,13 @@ def sweep_one(args, device, K):
         return
     print()
 
+    # D=1 is the sparsest the layer can be (coverage K/N, near zero); the loop
+    # runs to --max-coverage, where coverage 1.0 is D=N/K (each soma tiles the
+    # input once) and 2.0 is each soma tiling it twice.
+    d_max = max(1, round(args.max_coverage * N / K))
     d = 1
     fwd_rows, fb_rows = [], []
-    while d <= N // K:
+    while d <= d_max:
         if args.readout:
             m = DendriticMLP(N, S, out_features=S, fan_in=K,
                              dendrites_per_soma=d).to(device)
@@ -223,7 +227,7 @@ def sweep_one(args, device, K):
                   f"(coverage ~= {hit[1]:.3f}, {hit[1] * N:.0f} of {N} inputs per soma)")
         elif rows and rows[-1][2] < 1.0:
             print(f"  {name}: still {1/rows[-1][2]:.1f}x FASTER than dense at "
-                  f"D={rows[-1][0]} (coverage 1.0) — never crosses")
+                  f"D={rows[-1][0]} (coverage {rows[-1][1]:.2f}) — never crosses")
         else:
             print(f"  {name}: slower than dense across the whole sweep")
 
@@ -239,6 +243,9 @@ def main():
                     help="grow D until the dendritic layer costs as much as dense")
     ap.add_argument("--readout", action="store_true",
                     help="sweep with the dense readout layer on both models")
+    ap.add_argument("--max-coverage", type=float, default=2.0,
+                    help="how far the sweep runs; 1.0 = each soma tiles the "
+                         "input once, 2.0 = twice")
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--in-features", type=int, default=1024)
     ap.add_argument("--out-features", type=int, default=256)
