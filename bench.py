@@ -184,7 +184,6 @@ def sweep(args, device):
             m = DendriticMLP(N, S, out_features=S, fan_in=K,
                              dendrites_per_soma=d).to(device)
             info = m.sparsity()
-            info["inputs_seen_per_soma"] = min(d * K, N)
         else:
             m = DendriticLinear(N, S, fan_in=K, dendrites_per_soma=d).to(device)
             info = m.sparsity()

@@ -29,7 +29,16 @@ sparse. Setting `D = N/K` makes every soma read the whole input, which costs as 
 as a dense layer while executing far slower. That's what the legacy `coverage=1.0`
 does and it is almost never what you want.
 
+Since one soma only sees `D*K` inputs, soma are split into `G = ceil(N / (D*K))`
+groups and each group reads a different window of the input, so collectively they
+cover everything. `layer.sparsity()["inputs_covered"]` reports this, and the tests
+assert that every input's gradient is non-zero.
+
 ### Results
+
+**These numbers predate the input-coverage fix** — they were measured when every soma
+read the same first `D*K` inputs, so the layer was doing less work than intended. They
+need a rerun.
 
 On an RTX 5090, fp32, at 2048 → 2048 hidden → 512, batch 16384:
 
