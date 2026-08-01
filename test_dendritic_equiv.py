@@ -17,7 +17,9 @@ CASES = [
     (60, 16, 16, 4),      # N not divisible by the window
     (48, 8, 1.0, 1),      # K == N, D == 1
     (256, 32, 16, 16),    # window 256 == N, full coverage per soma
-    (256, 6, 16, 4),      # S with few divisors -> G reduced
+    (256, 6, 16, 4),      # S prime-ish: G does not divide S, soma padded
+    (2048, 10, 16, 51),   # the 2048->510->10 case: G=3 vs S=10
+    (2048, 10, 16, 4),    # too few soma to cover N at all
 ]
 
 
@@ -63,10 +65,12 @@ def test_every_input_is_used():
         assert touched == covered, (
             f"N={N} S={S} D={D}: gradient reaches {touched} inputs but "
             f"sparsity() claims {covered}")
-        if m.G * m.window >= N:
+        # Full coverage must hold whenever there are enough soma to reach every
+        # input; only S*D*K < N is a legitimate excuse for missing some.
+        if S * D * m.K >= N:
             assert touched == N, (
-                f"N={N} S={S} D={D}: groups should tile the input but only "
-                f"{touched}/{N} inputs are used")
+                f"N={N} S={S} D={D}: {S}*{D}*{m.K} >= {N} so the groups should "
+                f"tile the input, but only {touched}/{N} inputs are used")
 
         # and each soma individually sees only its own window
         assert len(set(m.soma_indices()[0].flatten().tolist())) <= m.window

@@ -27,9 +27,14 @@ class DendriticLinear(nn.Module):
 
         group g covers inputs [g*D*K, (g+1)*D*K)   (mod N)
 
-    with G chosen so the groups tile the whole input — G = ceil(N / (D*K)),
-    reduced to a divisor of S. Collectively the soma see everything; each one
-    individually still sees only its own D*K.
+    with G = ceil(N / (D*K)) so the groups tile the whole input. Collectively
+    the soma see everything; each one individually still sees only its own D*K.
+
+    G does not have to divide S: the soma count is padded internally to
+    G*ceil(S/G) and the surplus is sliced off the output, so coverage is never
+    traded away for a tidy reshape. The waste is at most (G-1)/S of the layer,
+    and `sparsity()["padded_soma"]` reports it. Full coverage is impossible
+    only when S*D*K < N, i.e. there are too few soma to reach every input.
 
     When G * D * K == N the windows line up with a plain reshape, so no gather
     happens at all and the dendrite stage is a single batched matmul.
@@ -74,28 +79,32 @@ class DendriticLinear(nn.Module):
             self.D = 4
 
         S, D, K = out_features, self.D, self.K
-        self.M = S * D
         self.window = D * K          # inputs a single soma sees
 
-        # Groups of soma, each reading a different window, chosen to tile the
-        # input. Reduced to a divisor of S so the grouping is a clean reshape.
-        G = min(math.ceil(in_features / self.window), S)
-        while S % G:
-            G -= 1
-        self.G, self.Sg = G, S // G
+        # Groups of soma, each reading a different window, chosen so the
+        # windows tile the input. G need not divide S: the soma count is padded
+        # up to G*ceil(S/G) internally and the extra soma are sliced off the
+        # output, which keeps the grouping a clean reshape without ever
+        # sacrificing input coverage. The padding waste is at most (G-1)/S.
+        self.G = min(math.ceil(in_features / self.window), S)
+        self.Sg = math.ceil(S / self.G)
+        self.S_pad = self.G * self.Sg
+        self.M = S * D               # dendrites that actually reach the output
+        self.M_pad = self.S_pad * D
 
         # taps[g] = the window of input indices group g reads.
         taps = (torch.arange(G).unsqueeze(1) * self.window
                 + torch.arange(self.window)) % in_features
         self.register_buffer("taps", taps)                      # (G, window)
         # When the windows tile the input exactly they are just a reshape.
-        self.exact_tiling = G * self.window == in_features
+        self.exact_tiling = self.G * self.window == in_features
 
-        self.synaptic = nn.Parameter(torch.empty(self.M, K))    # dendrite weights
-        self.cable = nn.Parameter(torch.empty(S, D))            # dendrite -> soma
+        # Sized for the padded soma count; the tail is dropped in forward.
+        self.synaptic = nn.Parameter(torch.empty(self.M_pad, K))  # dendrite weights
+        self.cable = nn.Parameter(torch.empty(self.S_pad, D))     # dendrite -> soma
 
         if bias:
-            self.dendrite_bias = nn.Parameter(torch.zeros(self.M))
+            self.dendrite_bias = nn.Parameter(torch.zeros(self.M_pad))
             self.soma_bias = nn.Parameter(torch.zeros(S))
         else:
             self.register_parameter("dendrite_bias", None)
@@ -132,7 +141,8 @@ class DendriticLinear(nn.Module):
         # Soma: weighted sum over each soma's own D dendrites.
         cable = self.cable.view(G, Sg, D).permute(0, 2, 1).unsqueeze(2)
         s = (h * cable).sum(1)                                   # (G, B, Sg)
-        s = s.permute(1, 0, 2).reshape(*lead, self.out_features)
+        s = s.permute(1, 0, 2).reshape(-1, self.S_pad)            # (B, S_pad)
+        s = s[:, : self.out_features].reshape(*lead, self.out_features)
 
         if self.soma_bias is not None:
             s = s + self.soma_bias
@@ -143,19 +153,21 @@ class DendriticLinear(nn.Module):
         """(S, D, K) — which input each soma's dendrites read. Reference /
         introspection only; the forward never builds this."""
         per_group = self.taps.view(self.G, self.D, self.K)
-        return per_group.repeat_interleave(self.Sg, dim=0)
+        idx = per_group.repeat_interleave(self.Sg, dim=0)         # (S_pad, D, K)
+        return idx[: self.out_features]
 
     def forward_reference(self, x: torch.Tensor) -> torch.Tensor:
         """Straightforward gather implementation. Slow — it materializes a
         (..., S, D, K) tensor — and used only to check `forward`."""
+        S, D, K = self.out_features, self.D, self.K
         idx = self.soma_indices()                                # (S, D, K)
         g = x[..., idx]                                          # (..., S, D, K)
-        d = (g * self.synaptic.view(self.out_features, self.D, self.K)).sum(-1)
+        d = (g * self.synaptic[: S * D].view(S, D, K)).sum(-1)
         if self.dendrite_bias is not None:
-            d = d + self.dendrite_bias.view(self.out_features, self.D)
+            d = d + self.dendrite_bias[: S * D].view(S, D)
         d = F.leaky_relu(d, 0.1)
 
-        s = (d * self.cable).sum(-1)
+        s = (d * self.cable[:S]).sum(-1)
         if self.soma_bias is not None:
             s = s + self.soma_bias
         return s
@@ -169,6 +181,7 @@ class DendriticLinear(nn.Module):
         return {
             "dendrites": self.M,
             "groups": self.G,
+            "padded_soma": self.S_pad - self.out_features,
             "inputs_seen_per_soma": min(self.window, self.in_features),
             "inputs_covered": min(self.G * self.window, self.in_features),
             "macs": ours,
@@ -179,10 +192,12 @@ class DendriticLinear(nn.Module):
     def extra_repr(self) -> str:
         p = sum(p.numel() for p in self.parameters())
         cov = self.sparsity()
+        pad = f", padded_soma={cov['padded_soma']}" if cov["padded_soma"] else ""
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"K={self.K}, D={self.D}, M={self.M}, groups={self.G}, "
-            f"covers={cov['inputs_covered']}/{self.in_features}, total_params={p}"
+            f"covers={cov['inputs_covered']}/{self.in_features}{pad}, "
+            f"total_params={p}"
         )
 
 
