@@ -1,16 +1,20 @@
-"""Speed/params/FLOPs for StagedLinear against a plain Linear + leaky_relu.
+"""Speed/params/FLOPs for the three per-neuron variants against a plain
+Linear + leaky_relu.
 
-Everything is width-matched, so the only difference is how many per-neuron
-scale/shift/nonlinearity stages sit on top of the one matmul. The question is
-whether extra stages are effectively free.
+All are width-matched — one dense matmul, then something cheap per neuron:
 
-extra_stages=0 is a plain Linear + leaky_relu with no extra parameters, so it
-should land exactly on the baseline; anything above that is the real cost.
+    staged     k sequential scale/shift/nonlinearity stages (slopes multiply)
+    branched   k parallel branches summed together (slopes add)
+    neighbors  a second stage reading k neurons instead of 1 (mixing)
+
+Setting 0 makes each of them a plain Linear + leaky_relu with no extra
+parameters, so those rows should land on the baseline and anything above is
+the real cost.
 
 Usage:
     python bench_staged.py
     python bench_staged.py --extra-stages 0,1,4,8 --batch 16384
-    python bench_staged.py --no-compile
+    python bench_staged.py --no-variants --no-compile
 """
 
 import argparse
@@ -20,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from bench import sync, timeit
+from branched_linear import BranchedLinear
+from neighbor_linear import NeighborLinear
 from staged_linear import StagedLinear
 
 torch._dynamo.config.recompile_limit = 64
@@ -73,6 +79,8 @@ def main():
                          "Linear + leaky_relu")
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--no-variants", action="store_true",
+                    help="staged only; skip the branched and neighbor rows")
     ap.add_argument("--shape", default=None, help="N,M (default: several)")
     args = ap.parse_args()
     stage_list = [int(s) for s in args.extra_stages.split(",") if s.strip()]
@@ -112,10 +120,24 @@ def main():
                              "  ^ compiled", N * M, base) or base
             torch._dynamo.reset()
 
+        variants = []
         for s in stage_list:
-            m_ = StagedLinear(N, M, extra_stages=s).to(device)
+            variants.append((
+                f"staged x{s}" + (" = plain" if s == 0 else ""),
+                lambda s=s: StagedLinear(N, M, extra_stages=s)))
+        if not args.no_variants:
+            for b in stage_list:
+                variants.append((
+                    f"branched x{b}" + (" = plain" if b == 0 else ""),
+                    lambda b=b: BranchedLinear(N, M, extra_branches=b)))
+            for k in [n for n in (0, 1, 3, 5, 9) if n <= M]:
+                variants.append((
+                    f"neighbors x{k}" + (" = plain" if k == 0 else ""),
+                    lambda k=k: NeighborLinear(N, M, neighbors=k)))
+
+        for tag, build in variants:
+            m_ = build().to(device)
             c = m_.cost()
-            tag = f"extra={s} ({c['bends']} bends)" + (" = plain" if s == 0 else "")
             measure(m_, x, device, tag, c["macs"], base)
 
             if not args.no_compile:
