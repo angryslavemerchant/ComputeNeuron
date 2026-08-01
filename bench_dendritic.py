@@ -101,6 +101,12 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "fp16"])
     ap.add_argument("--ref", action="store_true",
                     help="also time the old gather forward (slow, memory-hungry)")
+    ap.add_argument("--fan-in", type=int, default=16,
+                    help="inputs per dendrite (canonical: 16)")
+    ap.add_argument("--compile", action="store_true",
+                    help="also time torch.compile'd DendriticLinear")
+    ap.add_argument("--sweep", action="store_true",
+                    help="explore other fan_in/coverage settings alongside the canonical one")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -108,7 +114,8 @@ def main():
 
     torch.manual_seed(0)
     name = torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"
-    print(f"torch {torch.__version__} | device={device} ({name}) | dtype={args.dtype}\n")
+    print(f"torch {torch.__version__} | device={device} ({name}) | dtype={args.dtype}")
+    print(f"canonical fan_in={args.fan_in} (inputs per dendrite)\n")
 
     configs = [
         (256, 256),
@@ -127,8 +134,13 @@ def main():
         bench(make_ffn(d, 4 * d), x, device, "FFN d->4d->d")
         bench(make_ffn(d, d), x, device, "FFN d->d->d")
 
-        # fan_in: float -> fraction of in_features, int -> absolute feature count
-        for fan_in, cov in [(0.1, 1.0), (0.25, 1.0), (0.1, 2.0), (0.5, 1.0), (16, 1.0), (64, 1.0)]:
+        # The canonical setting: small dendrites (fan_in inputs each), one
+        # tiling of the input. Everything else is exploratory.
+        settings = [(args.fan_in, 1.0)]
+        if args.sweep:
+            settings += [(args.fan_in, 2.0), (64, 1.0), (0.25, 1.0), (0.5, 1.0)]
+
+        for fan_in, cov in settings:
             m = DendriticLinear(d, d, fan_in=fan_in, coverage=cov)
             K, D = m.K, m.D
             f, fb = bench(
@@ -140,6 +152,8 @@ def main():
             )
             if args.ref:
                 bench(GatherRef(m), x, device, "  ^ old gather forward", extra=f"K={K} D={D}")
+            if args.compile:
+                bench(torch.compile(m), x, device, "  ^ torch.compile", extra=f"K={K} D={D}")
             del m
             if device.type == "cuda":
                 torch.cuda.empty_cache()
