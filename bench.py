@@ -78,8 +78,9 @@ def timeit(fn, device, warmup=8, min_seconds=0.3, max_iters=2000):
     return (time.perf_counter() - t0) / n * 1e3  # ms
 
 
-def measure(model, x, device, label, macs, base=None):
+def measure(model, x, device, label, macs, base=None, pad=26):
     params = sum(p.numel() for p in model.parameters())
+    tag = f"{label:<{pad}}" if pad else label
 
     try:
         with torch.no_grad():
@@ -98,13 +99,86 @@ def measure(model, x, device, label, macs, base=None):
         peak = torch.cuda.max_memory_allocated() / 1e6 if device.type == "cuda" else 0.0
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
-        print(f"  {label:<26} {params/1e3:>8.1f}K {macs/1e3:>9.1f}K {'OOM':>8} {'OOM':>9}")
+        print(f"  {tag} {params/1e3:>8.1f}K {macs/1e3:>9.1f}K {'OOM':>8} {'OOM':>9}")
         return None
 
     ratio = "" if base is None else f"{fwd/base[0]:>7.2f}x {fb/base[1]:>8.2f}x"
-    print(f"  {label:<26} {params/1e3:>8.1f}K {macs/1e3:>9.1f}K "
+    print(f"  {tag} {params/1e3:>8.1f}K {macs/1e3:>9.1f}K "
           f"{fwd:>8.3f} {fb:>9.3f} {peak:>8.0f}  {ratio}")
     return fwd, fb
+
+
+def crossover(rows):
+    """Where does the dendritic/dense ratio cross 1.0?
+
+    rows is [(D, coverage, ratio), ...] in increasing D. Returns an
+    interpolated (D, coverage) or None if it never crosses in range.
+    """
+    for (d0, c0, r0), (d1, c1, r1) in zip(rows, rows[1:]):
+        if r0 <= 1.0 <= r1:
+            t = (1.0 - r0) / (r1 - r0) if r1 != r0 else 0.0
+            return d0 + t * (d1 - d0), c0 + t * (c1 - c0)
+    return None
+
+
+def sweep(args, device):
+    """Grow the dendrite count until the layer costs as much as a dense one.
+
+    The dense baseline is FIXED at N -> N -> S. Only the dendritic layer grows
+    with D, so there is a real crossing point: the number of dendrites per soma
+    you can afford before you may as well have been dense.
+
+    Note that D * K is how many inputs each soma sees, so D = N/K (coverage
+    1.0) is the point where every soma reads the entire input.
+    """
+    B, N, S, K = args.batch, args.in_features, args.out_features, args.fan_in
+    x = torch.randn(B, N, device=device)
+
+    print(f"=== sweep: batch={B} | N={N} -> S={S} | K={K} ===")
+    print(f"  dense baseline: {N} -> {N} -> {S}\n")
+    print(f"  {'D':>4} {'M':>7} {'coverage':>9} {'seen/soma':>10} {'params':>9} "
+          f"{'MACs/vec':>10} {'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs dense")
+
+    base = measure(DenseMLP(N, N, S).to(device), x, device,
+                   f"dense {N}->{N}->{S}", DenseMLP.macs(N, N, S), pad=33)
+    if base is None:
+        return
+    print()
+
+    d = 1
+    fwd_rows, fb_rows = [], []
+    while d <= N // K:
+        m = DendriticLinear(N, S, fan_in=K, dendrites_per_soma=d).to(device)
+        info = m.sparsity()
+        if not args.no_compile:
+            torch._dynamo.reset()
+            m = torch.compile(m)
+
+        label = (f"{d:>4} {info['dendrites']:>7} {d * K / N:>9.3f} "
+                 f"{info['inputs_seen_per_soma']:>10}")
+        got = measure(m, x, device, label, info["macs"], base, pad=0)
+        if got is not None:
+            fwd_rows.append((d, d * K / N, got[0] / base[0]))
+            fb_rows.append((d, d * K / N, got[1] / base[1]))
+
+        if not args.no_compile:
+            torch._dynamo.reset()
+        del m
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        d *= 2
+
+    print()
+    for name, rows in (("forward", fwd_rows), ("fwd+bwd", fb_rows)):
+        hit = crossover(rows)
+        if hit:
+            print(f"  {name}: matches dense at D ~= {hit[0]:.1f} "
+                  f"(coverage ~= {hit[1]:.3f}, {hit[1] * N:.0f} of {N} inputs per soma)")
+        elif rows and rows[-1][2] < 1.0:
+            print(f"  {name}: still {1/rows[-1][2]:.1f}x FASTER than dense at "
+                  f"D={rows[-1][0]} (coverage 1.0) — never crosses")
+        else:
+            print(f"  {name}: slower than dense across the whole sweep")
 
 
 def main():
@@ -112,12 +186,21 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fan-in", type=int, default=16, help="inputs per dendrite (K)")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--sweep", action="store_true",
+                    help="grow D until the dendritic layer costs as much as dense")
+    ap.add_argument("--batch", type=int, default=16384)
+    ap.add_argument("--in-features", type=int, default=1024)
+    ap.add_argument("--out-features", type=int, default=256)
     args = ap.parse_args()
 
     device = torch.device(args.device)
     torch.manual_seed(0)
     name = torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"
     print(f"torch {torch.__version__} | {device} ({name}) | K={args.fan_in}\n")
+
+    if args.sweep:
+        sweep(args, device)
+        return
 
     # (batch, N inputs, M dendrites/hidden, S soma/outputs)
     configs = [
