@@ -149,17 +149,30 @@ def sweep(args, device):
 
     Note that D * K is how many inputs each soma sees, so D = N/K (coverage
     1.0) is the point where every soma reads the entire input.
+
+    With --readout both sides gain the extra fully connected layer, so the
+    comparison is DendriticMLP (N -> M -> S -> S) against a dense N -> N -> S
+    -> S. The readout is identical in both models, which flattens the curve:
+    it is a fixed cost the dendritic side pays no matter how small D is.
     """
     B, N, S, K = args.batch, args.in_features, args.out_features, args.fan_in
     x = torch.randn(B, N, device=device)
 
-    print(f"=== sweep: batch={B} | N={N} -> S={S} | K={K} ===")
-    print(f"  dense baseline: {N} -> {N} -> {S}\n")
+    shape = f"{N} -> {N} -> {S}" + (f" -> {S}" if args.readout else "")
+    print(f"=== sweep: batch={B} | N={N} -> S={S} | K={K}"
+          f"{' | +readout' if args.readout else ''} ===")
+    print(f"  dense baseline: {shape}\n")
     print(f"  {'D':>4} {'M':>7} {'coverage':>9} {'seen/soma':>10} {'params':>9} "
           f"{'MACs/vec':>10} {'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs dense")
 
-    base = measure(DenseMLP(N, N, S).to(device), x, device,
-                   f"dense {N}->{N}->{S}", DenseMLP.macs(N, N, S), pad=33)
+    if args.readout:
+        dense_model = DenseMLP3(N, N, S, S)
+        dense_macs = DenseMLP3.macs(N, N, S, S)
+    else:
+        dense_model = DenseMLP(N, N, S)
+        dense_macs = DenseMLP.macs(N, N, S)
+    base = measure(dense_model.to(device), x, device,
+                   f"dense {shape}", dense_macs, pad=33)
     if base is None:
         return
     print()
@@ -167,8 +180,14 @@ def sweep(args, device):
     d = 1
     fwd_rows, fb_rows = [], []
     while d <= N // K:
-        m = DendriticLinear(N, S, fan_in=K, dendrites_per_soma=d).to(device)
-        info = m.sparsity()
+        if args.readout:
+            m = DendriticMLP(N, S, out_features=S, fan_in=K,
+                             dendrites_per_soma=d).to(device)
+            info = m.sparsity()
+            info["inputs_seen_per_soma"] = min(d * K, N)
+        else:
+            m = DendriticLinear(N, S, fan_in=K, dendrites_per_soma=d).to(device)
+            info = m.sparsity()
         if not args.no_compile:
             torch._dynamo.reset()
             m = torch.compile(m)
@@ -207,6 +226,8 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--sweep", action="store_true",
                     help="grow D until the dendritic layer costs as much as dense")
+    ap.add_argument("--readout", action="store_true",
+                    help="sweep with the dense readout layer on both models")
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--in-features", type=int, default=1024)
     ap.add_argument("--out-features", type=int, default=256)
