@@ -63,13 +63,54 @@ Two caveats worth knowing:
 
 No accuracy results yet — the speed case is established, the quality case is not.
 
+## StagedLinear
+
+A different bet: instead of sparsifying the connections, keep the dense matmul and
+give each neuron a learnable activation shape.
+
+```
+z  = W x + b
+z <- leaky_relu(a_i * z + c_i)     for i in 1..stages
+```
+
+`a_i` and `c_i` are one scalar per neuron, so neuron *j* in each stage reads only
+neuron *j* below it. All mixing happens in the single matmul; the stages only bend
+each neuron's response curve, one extra bend per stage.
+
+```python
+from staged_linear import StagedLinear
+
+layer = StagedLinear(2048, 512, stages=2)
+```
+
+`stages=1` is the **control**, not a setting: `phi(a*(Wx+b)+c)` is affine inside the
+nonlinearity, so it is exactly `nn.Linear` + `leaky_relu` with rescaled weights.
+`stages=2` is the smallest setting that adds anything.
+
+Stages are nearly free — 2·`out_features` parameters and one elementwise pass each,
+against a matmul of `in_features`·`out_features`. At 2048 → 512 that's 1024 params on
+1.05M, ~0.1%.
+
+By default each stage uses a negative slope of `negative_slope**(1/stages)`, so the
+composite slope is 0.1 regardless of depth. Without that, stacking leaky_relu decays
+the negative slope geometrically (0.1 → 0.01 → 0.001) and depths would start from
+different functions, confounding the comparison.
+
+```bash
+python bench_staged.py --stages 1,2,4,8
+python test_staged_linear.py
+```
+
 ## Contents
 
 | File | What it is |
 |---|---|
-| `dendritic_linear.py` | `DendriticLinear`, plus `forward_reference` (the slow gather formulation) and `sparsity()` |
-| `bench.py` | Shape-matched dense vs dendritic benchmark |
-| `test_dendritic_equiv.py` | Verifies the fast forward matches the reference on values and gradients |
+| `dendritic_linear.py` | `DendriticLinear` and `DendriticMLP`, plus `forward_reference` and `sparsity()` |
+| `bench.py` | Shape-matched dense vs dendritic benchmark (`--sweep`, `--shape`, `--readout`) |
+| `test_dendritic_equiv.py` | Forward matches the reference; every input reaches the output |
+| `staged_linear.py` | `StagedLinear` — dense matmul, per-neuron learnable activation |
+| `bench_staged.py` | `StagedLinear` vs plain `Linear + leaky_relu` |
+| `test_staged_linear.py` | stages=1 folds to a plain layer; slope correction holds at depth |
 | `mgn.py` | Multi-gate neuron (MGN) layers, v1–v4: each neuron mixes SUM / AND / OR reductions with a learned per-neuron softmax gate |
 | `test_mgn.py` | Tests for the MGN layers |
 | `multi-gate-neuron-spec.md` | Design spec for the MGN family |
