@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from dendritic_linear import DendriticLinear
+from ring_dendritic import RingDendriticLinear
 
 
 def sync(device):
@@ -154,6 +155,27 @@ def main():
                 bench(GatherRef(m), x, device, "  ^ old gather forward", extra=f"K={K} D={D}")
             if args.compile:
                 bench(torch.compile(m), x, device, "  ^ torch.compile", extra=f"K={K} D={D}")
+            del m
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # --- Ring layer: N -> N/D soma, compared against a DENSE LAYER OF
+        # THE SAME SHAPE (N -> N/D), which is the honest baseline for it.
+        D = 4
+        S = d // D
+        print(f"  -- ring: {d} -> {S} soma, {d} dendrites, K={args.fan_in}, D={D} --")
+        r_fwd, r_fb = bench(nn.Linear(d, S), x, device, f"nn.Linear({d}, {S})")
+        for dil in (1, "uniform"):
+            m = RingDendriticLinear(d, S, fan_in=args.fan_in,
+                                    dendrites_per_soma=D, dilation=dil)
+            frac = m.sparsity()["fraction_of_dense"]
+            f, fb = bench(m, x, device, f"Ring(dilation={dil})",
+                          extra=f"M={m.M} {frac:.1%} of dense MACs")
+            print(f"  {'':<34} {'':>10} "
+                  f"{f/r_fwd:>8.1f}x {fb/r_fb:>9.1f}x            vs same-shape Linear")
+            if args.compile:
+                bench(torch.compile(m), x, device, "  ^ torch.compile",
+                      extra=f"M={m.M}")
             del m
             if device.type == "cuda":
                 torch.cuda.empty_cache()
