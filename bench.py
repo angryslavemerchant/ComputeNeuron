@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dendritic_linear import DendriticLinear
+from dendritic_linear import DendriticLinear, DendriticMLP
 
 # Dendritic layers are launch-bound in eager mode and recompile on grad-mode
 # flips; without this the later configs silently fall back to eager.
@@ -52,6 +52,25 @@ class DenseMLP(nn.Module):
     @staticmethod
     def macs(n, m, s):
         return n * m + m * s
+
+
+class DenseMLP3(nn.Module):
+    """N -> M -> S -> out, fully connected. Shape-matched to DendriticMLP."""
+
+    def __init__(self, n, m, s, out):
+        super().__init__()
+        self.fc1 = nn.Linear(n, m)
+        self.fc2 = nn.Linear(m, s)
+        self.fc3 = nn.Linear(s, out)
+
+    def forward(self, x):
+        h = F.leaky_relu(self.fc1(x), 0.1)
+        h = F.leaky_relu(self.fc2(h), 0.1)
+        return self.fc3(h)
+
+    @staticmethod
+    def macs(n, m, s, out):
+        return n * m + m * s + s * out
 
 
 def sync(device):
@@ -236,6 +255,26 @@ def main():
         del m
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+        # --- with a dense readout on the soma: N -> M -> S -> S ---
+        # Baseline is the same three layers fully connected, so this stays a
+        # like-for-like comparison.
+        print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {S} --")
+        base3 = measure(DenseMLP3(N, M, S, S).to(device), x, device,
+                        f"dense {N}->{M}->{S}->{S}", DenseMLP3.macs(N, M, S, S))
+        if base3 is not None:
+            mm = DendriticMLP(N, S, out_features=S, fan_in=args.fan_in,
+                              dendrites_per_soma=D).to(device)
+            info = mm.sparsity()
+            measure(mm, x, device, "dendritic + readout", info["macs"], base3)
+            if not args.no_compile:
+                torch._dynamo.reset()
+                measure(torch.compile(mm), x, device, "  ^ compiled",
+                        info["macs"], base3)
+                torch._dynamo.reset()
+            del mm
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         print()
 
 

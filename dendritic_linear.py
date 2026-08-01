@@ -176,3 +176,73 @@ class DendriticLinear(nn.Module):
             f"K={self.K}, D={self.D}, M={self.M}, "
             f"total_params={p}"
         )
+
+
+class DendriticMLP(nn.Module):
+    """DendriticLinear followed by a dense readout.
+
+        N inputs -> M dendrites -> leaky_relu -> S soma -> leaky_relu
+                 -> out_features   (fully connected)
+
+    The point of the readout is mixing. In DendriticLinear each soma only ever
+    sees D*K of the N inputs (64 of 1024 at the defaults) and soma never see
+    each other, so nothing in the layer combines information across soma. One
+    dense layer on the soma fixes that: every output reads every soma.
+
+    Cost note: the readout is S * out_features weights, which at S=256 and
+    out_features=256 is 65.8K — more than the 18.7K in the dendritic stage
+    itself. It is the expensive part of this model, so keep S modest. Sizing
+    the soma layer narrow and letting the readout widen is usually the right
+    trade, since that is the direction that keeps the dense matmul small.
+
+    Args:
+        in_features:        Input dimension (N).
+        soma:               Number of soma (S) — the dendritic layer's width.
+        out_features:       Final output dimension. Defaults to `soma`.
+        fan_in:             Inputs per dendrite (K).
+        dendrites_per_soma: D. Total dendrites M = soma * D.
+        bias:               Bias terms throughout.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        soma: int,
+        out_features: int | None = None,
+        fan_in: int | float = 16,
+        dendrites_per_soma: int = 4,
+        bias: bool = True,
+    ):
+        super().__init__()
+        out_features = soma if out_features is None else out_features
+        self.dendritic = DendriticLinear(
+            in_features, soma, fan_in=fan_in,
+            dendrites_per_soma=dendrites_per_soma, bias=bias,
+        )
+        self.readout = nn.Linear(soma, out_features, bias=bias)
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = F.leaky_relu(self.dendritic(x), 0.1)
+        return self.readout(s)
+
+    def sparsity(self) -> dict:
+        """MACs per input vector, split across the two stages.
+
+        The dense comparison is the same three layers fully connected:
+        Linear(N, M) -> Linear(M, S) -> Linear(S, out).
+        """
+        d = self.dendritic
+        readout = d.out_features * self.out_features
+        ours = d.sparsity()["macs"] + readout
+        dense = (d.in_features * d.M + d.M * d.out_features
+                 + d.out_features * self.out_features)
+        return {
+            "dendrites": d.M,
+            "dendritic_macs": d.sparsity()["macs"],
+            "readout_macs": readout,
+            "macs": ours,
+            "dense_macs": dense,
+            "fraction_of_dense": ours / dense,
+        }
