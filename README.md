@@ -119,6 +119,7 @@ python test_staged_linear.py
 | `test_staged_linear.py` | stages=1 folds to a plain layer; slope correction holds at depth |
 | `mgn.py` | Multi-gate neuron (MGN) layers, v1–v4: each neuron mixes SUM / AND / OR reductions with a learned per-neuron softmax gate |
 | `test_mgn.py` | Tests for the MGN layers |
+| `BENCHMARKING.md` | Pitfalls that produced wrong numbers here — read before trusting a result |
 | `multi-gate-neuron-spec.md` | Design spec for the MGN family |
 | `new_neuron_guide.md` | Notes on adding a new neuron type |
 
