@@ -93,7 +93,7 @@ class DendriticLinear(nn.Module):
         self.M_pad = self.S_pad * D
 
         # taps[g] = the window of input indices group g reads.
-        taps = (torch.arange(G).unsqueeze(1) * self.window
+        taps = (torch.arange(self.G).unsqueeze(1) * self.window
                 + torch.arange(self.window)) % in_features
         self.register_buffer("taps", taps)                      # (G, window)
         # When the windows tile the input exactly they are just a reshape.
@@ -176,10 +176,13 @@ class DendriticLinear(nn.Module):
     def sparsity(self) -> dict:
         """Multiply-adds per input vector vs the shape-matched dense MLP
         (Linear(N, M) -> leaky_relu -> Linear(M, S))."""
-        ours = self.M * self.K + self.M
+        # MACs count the padded dendrites, since that is the work actually
+        # executed; self.M is how many of them reach the output.
+        ours = self.M_pad * self.K + self.M_pad
         dense = self.in_features * self.M + self.M * self.out_features
         return {
             "dendrites": self.M,
+            "dendrites_computed": self.M_pad,
             "groups": self.G,
             "padded_soma": self.S_pad - self.out_features,
             "inputs_seen_per_soma": min(self.window, self.in_features),
@@ -257,7 +260,8 @@ class DendriticMLP(nn.Module):
                  + d.out_features * self.out_features)
         return {
             **{k: inner[k] for k in
-               ("dendrites", "groups", "inputs_seen_per_soma", "inputs_covered")},
+               ("dendrites", "dendrites_computed", "groups", "padded_soma",
+                "inputs_seen_per_soma", "inputs_covered")},
             "dendritic_macs": inner["macs"],
             "readout_macs": readout,
             "macs": ours,
