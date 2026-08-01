@@ -30,11 +30,12 @@ class DendriticLinear(nn.Module):
     with G = ceil(N / (D*K)) so the groups tile the whole input. Collectively
     the soma see everything; each one individually still sees only its own D*K.
 
-    G does not have to divide S: the soma count is padded internally to
-    G*ceil(S/G) and the surplus is sliced off the output, so coverage is never
-    traded away for a tidy reshape. The waste is at most (G-1)/S of the layer,
-    and `sparsity()["padded_soma"]` reports it. Full coverage is impossible
-    only when S*D*K < N, i.e. there are too few soma to reach every input.
+    G does not have to divide S: the soma count is padded internally and the
+    surplus sliced off the output, so coverage is never traded away for a tidy
+    reshape. Every group is guaranteed at least one real soma, the padding is
+    smaller than one group, and `sparsity()["padded_soma"]` reports it. Full
+    coverage is impossible only when S*D*K < N — genuinely too few soma to
+    reach every input.
 
     When G * D * K == N the windows line up with a plain reshape, so no gather
     happens at all and the dendrite stage is a single batched matmul.
@@ -81,13 +82,19 @@ class DendriticLinear(nn.Module):
         S, D, K = out_features, self.D, self.K
         self.window = D * K          # inputs a single soma sees
 
-        # Groups of soma, each reading a different window, chosen so the
-        # windows tile the input. G need not divide S: the soma count is padded
-        # up to G*ceil(S/G) internally and the extra soma are sliced off the
-        # output, which keeps the grouping a clean reshape without ever
-        # sacrificing input coverage. The padding waste is at most (G-1)/S.
-        self.G = min(math.ceil(in_features / self.window), S)
-        self.Sg = math.ceil(S / self.G)
+        # Groups of soma, each reading a different window, chosen so the windows
+        # tile the input. G need not divide S: the soma count is padded to a
+        # multiple of the group size and the surplus is sliced off the output,
+        # so the grouping stays a clean reshape without costing coverage.
+        #
+        # Sg is derived FIRST and G from it, not the other way around. Taking
+        # G = ceil(N/window) and Sg = ceil(S/G) can push a whole group into the
+        # padded tail (S=6, G=4 -> Sg=2 -> group 3 is soma 6..7, both padding),
+        # silently dropping that group's window. Deriving G = ceil(S/Sg)
+        # guarantees (G-1)*Sg < S, so every group keeps at least one soma.
+        groups_needed = math.ceil(in_features / self.window)
+        self.Sg = max(1, S // groups_needed)
+        self.G = math.ceil(S / self.Sg)
         self.S_pad = self.G * self.Sg
         self.M = S * D               # dendrites that actually reach the output
         self.M_pad = self.S_pad * D

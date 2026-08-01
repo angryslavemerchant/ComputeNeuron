@@ -20,6 +20,9 @@ CASES = [
     (256, 6, 16, 4),      # S prime-ish: G does not divide S, soma padded
     (2048, 10, 16, 51),   # the 2048->510->10 case: G=3 vs S=10
     (2048, 10, 16, 4),    # too few soma to cover N at all
+    (256, 6, 16, 4),      # S=6, 4 windows needed: a group must not be all padding
+    (256, 7, 16, 4),      # likewise with an odd soma count
+    (1000, 12, 16, 5),    # nothing divides anything
 ]
 
 
@@ -74,6 +77,13 @@ def test_every_input_is_used():
 
         # and each soma individually sees only its own window
         assert len(set(m.soma_indices()[0].flatten().tolist())) <= m.window
+
+        # every group must own at least one real (non-padding) soma, else its
+        # window is computed and then thrown away
+        assert (m.G - 1) * m.Sg < S, (
+            f"N={N} S={S} D={D}: group {m.G - 1} is entirely padding "
+            f"(G={m.G}, Sg={m.Sg}, S_pad={m.S_pad})")
+        assert m.S_pad - S < m.Sg, f"padding {m.S_pad - S} >= group size {m.Sg}"
     print("  ok  every input reaches the output")
 
 
