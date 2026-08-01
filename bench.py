@@ -164,9 +164,10 @@ def sweep_one(args, device, K):
     it is a fixed cost the dendritic side pays no matter how small D is.
     """
     B, N, S = args.batch, args.in_features, args.out_features
+    DH = args.dense_hidden or N          # dense baseline's hidden width
     x = torch.randn(B, N, device=device)
 
-    shape = f"{N} -> {N} -> {S}" + (f" -> {S}" if args.readout else "")
+    shape = f"{N} -> {DH} -> {S}" + (f" -> {S}" if args.readout else "")
     print(f"=== sweep: batch={B} | N={N} -> S={S} | K={K}"
           f"{' | +readout' if args.readout else ''} ===")
     print(f"  dense baseline: {shape}\n")
@@ -175,11 +176,11 @@ def sweep_one(args, device, K):
           f"{'peakMB':>8}   vs dense")
 
     if args.readout:
-        dense_model = DenseMLP3(N, N, S, S)
-        dense_macs = DenseMLP3.macs(N, N, S, S)
+        dense_model = DenseMLP3(N, DH, S, S)
+        dense_macs = DenseMLP3.macs(N, DH, S, S)
     else:
-        dense_model = DenseMLP(N, N, S)
-        dense_macs = DenseMLP.macs(N, N, S)
+        dense_model = DenseMLP(N, DH, S)
+        dense_macs = DenseMLP.macs(N, DH, S)
     base = measure(dense_model.to(device), x, device,
                    f"dense {shape}", dense_macs, pad=40)
     if base is None:
@@ -241,14 +242,23 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--sweep", action="store_true",
                     help="grow D until the dendritic layer costs as much as dense")
-    ap.add_argument("--readout", action="store_true",
-                    help="sweep with the dense readout layer on both models")
+    ap.add_argument("--no-readout", dest="readout", action="store_false",
+                    help="sweep WITHOUT the dense readout layer (it is on by "
+                         "default, on both models)")
+    ap.set_defaults(readout=True)
+    ap.add_argument("--shape", default=None,
+                    help="override the built-in configs: N,M,S or N,M,S,out "
+                         "(e.g. --shape 2048,512,10,10). M is the hidden/dendrite "
+                         "count and is rounded to a multiple of S.")
     ap.add_argument("--max-coverage", type=float, default=2.0,
                     help="how far the sweep runs; 1.0 = each soma tiles the "
                          "input once, 2.0 = twice")
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--in-features", type=int, default=1024)
     ap.add_argument("--out-features", type=int, default=256)
+    ap.add_argument("--dense-hidden", type=int, default=None,
+                    help="sweep only: hidden width of the fixed dense baseline "
+                         "(default N). The dendritic side's M varies with D.")
     args = ap.parse_args()
     args.fan_in = [int(v) for v in str(args.fan_in).split(",") if v.strip()]
 
@@ -262,19 +272,30 @@ def main():
         sweep(args, device)
         return
 
-    # (batch, N inputs, M dendrites/hidden, S soma/outputs)
-    configs = [
-        (1024, 1024, 1024, 256),
-        (1024, 1024, 512, 128),      # fewer dendrites -> narrower dense hidden too
-        (16384, 1024, 1024, 256),    # big batch: throughput, not launch latency
-        (16384, 2048, 2048, 512),
-    ]
+    # (batch, N inputs, M dendrites/hidden, S soma, out)
+    if args.shape:
+        v = [int(t) for t in args.shape.split(",")]
+        if len(v) not in (3, 4):
+            ap.error("--shape wants N,M,S or N,M,S,out")
+        configs = [(args.batch, v[0], v[1], v[2], v[3] if len(v) == 4 else v[2])]
+    else:
+        configs = [
+            (1024, 1024, 1024, 256, 256),
+            (1024, 1024, 512, 128, 128),   # fewer dendrites, narrower dense hidden
+            (16384, 1024, 1024, 256, 256),  # big batch: throughput, not latency
+            (16384, 2048, 2048, 512, 512),
+        ]
 
-    for B, N, M, S in configs:
-        D = M // S
+    for B, N, M_want, S, OUT in configs:
+        # M must be S*D, so the requested hidden width is rounded to a multiple
+        # of S and the dense baseline uses the SAME M to stay shape-matched.
+        D = max(1, round(M_want / S))
+        M = S * D
         x = torch.randn(B, N, device=device)
 
-        print(f"=== batch={B} | {N} inputs -> {M} hidden -> {S} out | D={D} ===")
+        note = f" (hidden {M_want} -> {M} to be a multiple of S)" if M != M_want else ""
+        print(f"=== batch={B} | {N} -> {M} hidden -> {S} soma -> {OUT} out "
+              f"| D={D}{note} ===")
         print(f"  {'module':<26} {'params':>9} {'MACs/vec':>10} "
               f"{'fwd(ms)':>8} {'fwd+bwd':>9} {'peakMB':>8}   vs dense")
 
@@ -301,15 +322,15 @@ def main():
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        # --- with a dense readout on the soma: N -> M -> S -> S ---
-        # Baseline is the same three layers fully connected, so this stays a
+        # --- with a dense readout on the soma: N -> M -> S -> OUT ---
+        # Baseline is the same four layers fully connected, so this stays a
         # like-for-like comparison.
-        print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {S} --")
-        base3 = measure(DenseMLP3(N, M, S, S).to(device), x, device,
-                        f"dense {N}->{M}->{S}->{S}", DenseMLP3.macs(N, M, S, S))
+        print(f"  -- plus dense readout: {N} -> {M} -> {S} -> {OUT} --")
+        base3 = measure(DenseMLP3(N, M, S, OUT).to(device), x, device,
+                        f"dense {N}->{M}->{S}->{OUT}", DenseMLP3.macs(N, M, S, OUT))
         if base3 is not None:
             for K in args.fan_in:
-                mm = DendriticMLP(N, S, out_features=S, fan_in=K,
+                mm = DendriticMLP(N, S, out_features=OUT, fan_in=K,
                                   dendrites_per_soma=D).to(device)
                 info = mm.sparsity()
                 measure(mm, x, device, f"dendritic K={K} + readout",
