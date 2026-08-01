@@ -51,7 +51,28 @@ def make_ffn(d, hidden):
     return nn.Sequential(nn.Linear(d, hidden), nn.GELU(), nn.Linear(hidden, d))
 
 
+class GatherRef(nn.Module):
+    """Wraps DendriticLinear to run the old gather-based forward, so the
+    einsum speedup is visible as a direct A/B."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x):
+        return self.inner.forward_reference(x)
+
+
 def bench(model, x, device, label, extra=""):
+    try:
+        return _bench(model, x, device, label, extra)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(f"  {label:<34} {'':>10} {'OOM':>9} {'OOM':>10} {'':>9}  {extra}")
+        return float("nan"), float("nan")
+
+
+def _bench(model, x, device, label, extra=""):
     model = model.to(device=device, dtype=x.dtype)
     params = sum(p.numel() for p in model.parameters())
 
@@ -78,6 +99,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "fp16"])
+    ap.add_argument("--ref", action="store_true",
+                    help="also time the old gather forward (slow, memory-hungry)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -115,6 +138,8 @@ def main():
                 f"  {'':<34} {'':>10} "
                 f"{f/base_fwd:>8.1f}x {fb/base_fb:>9.1f}x            vs nn.Linear"
             )
+            if args.ref:
+                bench(GatherRef(m), x, device, "  ^ old gather forward", extra=f"K={K} D={D}")
             del m
             if device.type == "cuda":
                 torch.cuda.empty_cache()
